@@ -58,7 +58,9 @@ the profile's `cordis.patch.yml`:
 ```
 
 `cwd` is the workspace root the booted profile runs in. `port` is the port the
-control watches, starts, and stops; it is never inferred.
+control watches, starts, and stops; it is never inferred. `stopGraceMs` is the
+grace after a console event was *generated*, so it applies only to the console
+rung; a profile this plugin started is terminated without waiting for it.
 
 ## How it is built
 
@@ -95,9 +97,10 @@ every three seconds. It owns no process and holds no privileged state.
 window opens, nothing is left on screen after the click, and the profile's output
 is appended to `$DSH_HOME/logs/webui-switch/webui.log`. There is no terminal to
 press Ctrl+C in: a profile this plugin started is stopped by **terminating its
-process tree** (`taskkill /T /F`). It is terminated immediately - the console rung
-cannot attach to a process that has no console, so no `stopGraceMs` elapses on
-this path. That is the path this plugin was built for.
+process tree** (`taskkill /T /F`). Nothing waits on that path - the console rung
+cannot attach to a process that has no console, so no `stopGraceMs` elapses; the
+only delay is the helper's failed PowerShell start-up, about a second. That is the
+path this plugin was built for.
 
 **Why a console Ctrl+C is still tried first.** A Web profile somebody else started -
 in practice a `dsh web` you ran yourself in a terminal - owns a console, and the
@@ -128,6 +131,10 @@ Stopping therefore walks a ladder and reports which step ended it:
 1. **console Ctrl+C** - `AttachConsole` + `GenerateConsoleCtrlEvent`. Attempted
    first; it can only land on a Web profile that owns a console, and the attempt
    itself is how that is discovered (a process without one makes the helper exit 2).
+   It is generated only when the console holds nobody except the target at that
+   moment, and only when that can be judged at all: a shared - or unjudgeable -
+   console makes the helper refuse with exit 4 and the ladder escalates, so nothing
+   else on that console is ever signalled.
 2. **terminate the tree** - `taskkill /T /F`: immediately when no console event
    could be generated (always the case for a profile this plugin started), or after
    `stopGraceMs` when one was generated but the target did not leave.
@@ -160,6 +167,15 @@ observed would be worse than saying so.
   event reaches every process sharing that console, so anything else in the same
   terminal receives it too. Success means the event was generated, not that the
   profile acted on it; when it does not, the ladder escalates to a tree kill.
+- **The pid is resolved once, then checked again.** Windows recycles pids, so the
+  command line of the process about to be stopped is re-read immediately before
+  acting - including for a pid this plugin recorded itself, which is exactly the
+  one that can have been recycled. A readable line that no longer selects the
+  watched profile is refused as `target-changed` instead of being signalled or
+  killed; an unreadable line is not a reason to refuse.
+- **Not published to npm.** `package.json` sets `"private": true` on purpose: this
+  plugin is installed from the repository by `scripts/install.mjs`, not from a
+  registry.
 - **One WebUI.** The control watches exactly one port. A second instance on
   another port is neither adopted nor stopped.
 - **The profile is booted as a child of the Desktop Host.** Closing the Desktop
@@ -173,6 +189,11 @@ node test\smoke.mjs    # host half, against a test-double launcher
 node test\host.mjs     # request handling, on a context that records what it registers
 node test\client.mjs   # client half, loaded the way the module system loads it
 ```
+
+`test/client.mjs` loads the real client bundle from the profile's `node_modules`;
+set `DSH_PROFILE_MODULES` to that directory when the suite runs outside the
+profile. Counts today: smoke 13 passed / 1 skipped (the skip is the opt-in live
+probe, `DSH_WEBUI_LIVE_PORT`), host 11 passed, client 6 passed.
 
 No suite boots a real profile or touches a process you are working in. One
 check is opt-in: set `DSH_WEBUI_LIVE_PORT=<port>` to have `test\smoke.mjs`

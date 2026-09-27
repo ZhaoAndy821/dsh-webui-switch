@@ -15,7 +15,8 @@ import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { isWebProfileCommand, listeningPid, portListening, start, status, stop, spawnPlan } from '../lib/webui-process.js'
+import { execFileSync, spawn } from 'node:child_process'
+import { isWebProfileCommand, listeningPid, portListening, start, status, stillSameTarget, stop, spawnPlan } from '../lib/webui-process.js'
 
 const HERE = fileURLToPath(new URL('.', import.meta.url))
 const DUMMY = join(HERE, 'fixtures', 'dummy-web.js')
@@ -108,9 +109,9 @@ await test_('the spawn plan gives the child no console, on purpose', () => {
   assert.equal(plan.command, 'C:/node.exe')
   assert.deepEqual(plan.args, ['C:/dsh/lib/bin.js', '--profile', 'web', '--port', '4115'])
   assert.equal(plan.detached, true)
-  // A consoleless process cannot be sent the console control event that the
-  // harness treats as a graceful stop, so the window is deliberately hidden and
-  // stopping falls through to terminating the tree.
+  // A detached process owns no console, so the console control event the harness
+  // treats as a graceful stop cannot be delivered to it, and stopping falls
+  // through to terminating the tree.
   assert.equal(plan.windowsHide, true)
 })
 
@@ -163,7 +164,7 @@ await test_('start boots the profile and stop ends it', async () => {
   process.env.DSH_WEBUI_TEST_MARKER = marker
   const scoped = { ...env, DSH_WEBUI_TEST_MARKER: marker }
 
-  const booted = await start({ port, profile: 'web', env: scoped, dshScript: DUMMY, timeoutMs: 30000, console: 'hidden' })
+  const booted = await start({ port, profile: 'web', env: scoped, dshScript: DUMMY, timeoutMs: 30000 })
   assert.equal(booted.running, true, 'the profile should be serving: ' + JSON.stringify(booted))
   assert.equal(booted.started, true)
   assert.equal(typeof booted.pid, 'number')
@@ -198,12 +199,37 @@ await test_('a process that ignores Ctrl+C is escalated to a tree kill', async (
     'utf8',
   )
   const port = await freePort()
-  const booted = await start({ port, profile: 'web', env, dshScript: stubborn, timeoutMs: 30000, console: 'hidden' })
+  const booted = await start({ port, profile: 'web', env, dshScript: stubborn, timeoutMs: 30000 })
   assert.equal(booted.running, true, 'the stubborn process should be serving')
   const stopped = await stop({ port, profile: 'web', env, graceMs: 1500 })
   assert.equal(stopped.stopped, true, 'escalation should still stop it: ' + JSON.stringify(stopped.steps))
   assert.equal(stopped.reason, 'terminated')
   assert.equal(await portListening(port), false)
+})
+
+await test_('a command line read at action time must still be the profile', () => {
+  const launcher = '"C:/node.exe" "C:/dsh/lib/bin.js" --profile web --port 4115'
+  assert.equal(stillSameTarget(launcher, 'web'), true)
+  assert.equal(stillSameTarget('"C:/node.exe" C:/other/app.js --serve', 'web'), false, 'a recycled pid must be refused')
+  assert.equal(stillSameTarget(undefined, 'web'), true, 'an unreadable line is not a reason to refuse')
+  assert.equal(stillSameTarget('cmd.exe /c ""C:/x/dsh.cmd" web --port 4115', 'web'), true, 'the npm shim still counts as the profile')
+})
+
+await test_('the console helper refuses a console it shares, and sends nothing', async () => {
+  const helper = fileURLToPath(new URL('../lib/send-console-ctrl.ps1', import.meta.url))
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)'], { stdio: 'ignore' })
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+    let code = 0
+    try {
+      execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helper, '-ProcessId', String(child.pid), '-DryRun'], { stdio: 'ignore' })
+    } catch (error) {
+      code = error.status
+    }
+    assert.equal(code, 4, 'a shared console must be refused rather than signalled (helper exit ' + code + ')')
+  } finally {
+    child.kill()
+  }
 })
 
 // Optional live section: a real Web profile, but only when the port is named

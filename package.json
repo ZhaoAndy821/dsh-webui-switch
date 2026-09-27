@@ -3,6 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "description": "Start, report, and stop the local Web profile from the Desktop app: one header control that boots the WebUI windowless in the background, shows whether it is serving, and stops it - terminating the profile it started, or a console Ctrl+C first for one you started yourself in a terminal.",
+  "author": "ZhaoAndy821 (https://github.com/ZhaoAndy821)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZhaoAndy821/dsh-webui-switch.git"
+  },
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",
