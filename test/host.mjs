@@ -13,9 +13,17 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import net from 'node:net'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+// These tests drive the real handlers, and a stop that finds nothing to stop
+// clears the record of the port it watches. Scope DSH_HOME to a throwaway home
+// before anything is mounted: without this line the suite deletes the record of
+// the profile the human is actually running, because that record lives in the
+// real home and the test only used a free port.
+process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-webui-switch-host-'))
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..')
