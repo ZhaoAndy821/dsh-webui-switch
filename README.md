@@ -95,16 +95,31 @@ every three seconds. It owns no process and holds no privileged state.
 **The normal case has no terminal.** The control boots the Web profile with
 `detached: true` (on Windows DETACHED_PROCESS) and `windowsHide`, so no console
 window opens, nothing is left on screen after the click, and the profile's output
-is appended to `$DSH_HOME/logs/webui-switch/webui.log`. There is no terminal to
-press Ctrl+C in: a profile this plugin started is stopped by **terminating its
-process tree** (`taskkill /T /F`). Nothing waits on that path - the console rung
-cannot attach to a process that has no console, so no `stopGraceMs` elapses; the
-only delay is the helper's failed PowerShell start-up, about a second. That is the
-path this plugin was built for.
+is appended to `$DSH_HOME/logs/webui-switch/webui.log`. The child therefore owns
+**no console**, and no console control event can reach it at all.
 
-**Why a console Ctrl+C is still tried first.** A Web profile somebody else started -
-in practice a `dsh web` you ran yourself in a terminal - owns a console, and the
-harness turns that console's Ctrl+C into a graceful teardown:
+**So the profile is asked to leave from inside.** Every start writes an overlay
+(`$DSH_HOME/webui-switch/web-stop.patch.yml`) and passes it as `--patch`, which
+mounts this package's Web-profile half - `lib/web-stop.js`, named by its own
+`file:` URL so the row resolves wherever the package is installed. That row
+injects the launcher's public `ctx.appExit`,
+
+> "a way to ask the process to exit once the tree has shut down, wired to the
+> launcher's shutdown controller" - `@deepseek-ai/dsh-cmdline`
+
+records that it can answer (`web-stop.<pid>.ready`) and polls for a request
+(`stop.<pid>.request`). A stop writes that request and waits `stopGraceMs`: the row
+calls `ctx.appExit(0)`, the launcher disposes the whole Cordis tree - every plugin
+flushes and releases what it holds - and the process exits with code 0. Measured
+against a real profile: **3.5 s from request to gone, exit code 0**, request, record
+and state file all cleared, and no `.tmp` or lock left under the profile's home.
+The same profile terminated by a tree kill exits 1, which is the outcome this rung
+exists to avoid: a hard kill cuts in-flight state writes, and a real profile has
+been observed to leave an orphaned `.tmp` payload and a held lock behind that way.
+
+**Why a console Ctrl+C is still tried - but only for a profile this plugin did not
+start.** A `dsh web` you ran yourself in a terminal owns a console, and the harness
+turns that console's Ctrl+C into a graceful teardown:
 
 ```js
 process.on('SIGTERM', () => interrupt(0))
@@ -113,38 +128,35 @@ process.on('SIGINT', () => interrupt(130))
 
 where `interrupt` aborts a signal controller and calls
 `createProcessShutdown(dispose).interrupt(code)` - a graceful teardown with a
-five-second cap before the process is forced out. For such a profile the plugin
-offers that event before escalating, so that it can end the way the command line
-would.
+five-second cap before the process is forced out. That rung is a broadcast, not a
+targeted signal: `GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)` reaches **every
+process that shares the console** - "this signal cannot be limited to a specific
+process group" - so it is generated only when the console holds nobody except the
+target and this helper; a shared or unjudgeable console makes the helper refuse
+with exit 4 and the ladder escalates, so nothing else on that console is ever
+signalled. It is skipped entirely for a profile this plugin started, which has no
+console to send it to.
 
-**That rung is a broadcast, not a targeted signal.** Windows cannot aim a
-CTRL_C_EVENT at a process: `GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)` is
-documented to reach **every process that shares the console** - "this signal cannot
-be limited to a specific process group" - so anything else running in that terminal
-receives it too. Success is also weaker than it sounds: the helper reports exit 0
-when the event was *generated*, not when the target acted on it, and an inherited
-"ignore Ctrl+C" attribute makes even a successful call a silent no-op - one of the
-outcomes measured while building this.
+**Giving a started profile its own console was measured and rejected.** Three
+launchers were tried - `cmd /c start`, `Start-Process -WindowStyle Hidden`, and
+`CreateProcessW` with `CREATE_NEW_CONSOLE`, with and without
+`CREATE_NEW_PROCESS_GROUP` (which Windows ignores beside `CREATE_NEW_CONSOLE`). In
+all three, `AttachConsole` succeeded and the helper reported the event as delivered,
+and in all three the target acted on none of them. A `CTRL_BREAK` *was* acted on -
+and killed the helper on its way out - but this harness registers `SIGINT` and
+`SIGTERM` only, so Ctrl+Break is an immediate exit wearing a graceful name.
+Promising a graceful stop that has not been observed would be worse than saying so.
 
 Stopping therefore walks a ladder and reports which step ended it:
 
-1. **console Ctrl+C** - `AttachConsole` + `GenerateConsoleCtrlEvent`. Attempted
-   first; it can only land on a Web profile that owns a console, and the attempt
-   itself is how that is discovered (a process without one makes the helper exit 2).
-   It is generated only when the console holds nobody except the target at that
-   moment, and only when that can be judged at all: a shared - or unjudgeable -
-   console makes the helper refuse with exit 4 and the ladder escalates, so nothing
-   else on that console is ever signalled.
-2. **terminate the tree** - `taskkill /T /F`: immediately when no console event
-   could be generated (always the case for a profile this plugin started), or after
-   `stopGraceMs` when one was generated but the target did not leave.
-
-A Web profile this plugin started has no console, so `AttachConsole` on it fails
-rather than delivering anything and it is always stopped by step 2. Giving one a
-console through `cmd /c start` was implemented and measured, and is deliberately
-not used: the control event came back as delivered but the target did not act on
-it, and the launch was not dependable. Promising a graceful stop that has not been
-observed would be worse than saying so.
+1. **app-exit request** - the handshake above. The request is written only when the
+   target left a ready record, so a profile that cannot answer (an older one, or one
+   whose overlay did not mount) is never made to wait out a grace it cannot use.
+2. **console Ctrl+C** - `AttachConsole` + `GenerateConsoleCtrlEvent`, for a target
+   this plugin did not start (see above).
+3. **terminate the tree** - `taskkill /T /F`: after `stopGraceMs` when a graceful
+   rung was attempted and the profile did not leave, and immediately when no
+   graceful rung applies.
 
 ## Known limitations
 
@@ -161,12 +173,17 @@ observed would be worse than saying so.
   `$DSH_HOME/logs/webui-switch/webui.log` instead. The header control is the only
   interface; if you want the profile in a terminal of your own, start `dsh web`
   on the port the control watches and it will adopt that instance.
-- **How it stops depends on who started it.** A profile this plugin started has no
-  console, so it is always terminated as a process tree. A profile you started in a
-  terminal owns a console: the first rung applies there, and it is a broadcast - the
+- **How it stops depends on who started it.** A profile this plugin started is asked
+  to leave through the stop handshake: it disposes its tree and exits 0. If it does
+  not answer - an older profile, or a handshake that did not mount - it is
+  terminated as a process tree. A profile you started in a terminal has no
+  handshake, so the console rung applies there instead, and it is a broadcast - the
   event reaches every process sharing that console, so anything else in the same
-  terminal receives it too. Success means the event was generated, not that the
-  profile acted on it; when it does not, the ladder escalates to a tree kill.
+  terminal receives it too. Success there means the event was generated, not that
+  the profile acted on it; when it does not, the ladder escalates to a tree kill.
+- **A profile killed from outside leaves its record.** The handshake files are keyed
+  by pid; a record whose process no longer exists is swept at the next start rather
+  than trusted, and only the pid that wrote it can be answered.
 - **The pid is resolved once, then checked again.** Windows recycles pids, so the
   command line of the process about to be stopped is re-read immediately before
   acting - including for a pid this plugin recorded itself, which is exactly the
@@ -192,7 +209,7 @@ node test\client.mjs   # client half, loaded the way the module system loads it
 
 `test/client.mjs` loads the real client bundle from the profile's `node_modules`;
 set `DSH_PROFILE_MODULES` to that directory when the suite runs outside the
-profile. Counts today: smoke 13 passed / 1 skipped (the skip is the opt-in live
+profile. Counts today: smoke 18 passed / 1 skipped (the skip is the opt-in live
 probe, `DSH_WEBUI_LIVE_PORT`), host 11 passed, client 6 passed.
 
 No suite boots a real profile or touches a process you are working in. One

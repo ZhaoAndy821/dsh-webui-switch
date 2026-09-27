@@ -3,7 +3,7 @@
  * Self-test for the host half's process control.
  *
  * The launcher is replaced by test/fixtures/dummy-web.js, so the suite proves
- * the mechanism - spawn, adopt a live port, deliver a console Ctrl+C, escalate,
+ * the mechanism - spawn, adopt a live port, answer the stop handshake, escalate,
  * and refuse a port this plugin does not own - without booting a profile and
  * without touching any process the user is working in.
  *
@@ -11,12 +11,13 @@
  */
 import assert from 'node:assert/strict'
 import net from 'node:net'
-import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFileSync, spawn } from 'node:child_process'
 import { isWebProfileCommand, listeningPid, portListening, start, status, stillSameTarget, stop, spawnPlan } from '../lib/webui-process.js'
+import { clearStopFiles, pruneStopFiles, readStopReady, stopReadyPath, stopRequestPath, switchDir, writeStopOverlay } from '../lib/web-stop.js'
 
 const HERE = fileURLToPath(new URL('.', import.meta.url))
 const DUMMY = join(HERE, 'fixtures', 'dummy-web.js')
@@ -109,10 +110,15 @@ await test_('the spawn plan gives the child no console, on purpose', () => {
   assert.equal(plan.command, 'C:/node.exe')
   assert.deepEqual(plan.args, ['C:/dsh/lib/bin.js', '--profile', 'web', '--port', '4115'])
   assert.equal(plan.detached, true)
-  // A detached process owns no console, so the console control event the harness
-  // treats as a graceful stop cannot be delivered to it, and stopping falls
-  // through to terminating the tree.
+  // A detached process owns no console, so no console control event can reach
+  // it; the stop handshake is what carries a graceful stop instead.
   assert.equal(plan.windowsHide, true)
+  const mounted = spawnPlan(launcher, { port: 4115, profile: 'web', patchPath: 'C:/x/web-stop.patch.yml' })
+  assert.deepEqual(
+    mounted.args,
+    ['C:/dsh/lib/bin.js', '--profile', 'web', '--patch', 'C:/x/web-stop.patch.yml', '--port', '4115'],
+    'the overlay must precede the app argument the launcher passes through',
+  )
 })
 
 await test_('status reports a stopped profile as not running', async () => {
@@ -169,24 +175,123 @@ await test_('start boots the profile and stop ends it', async () => {
   assert.equal(booted.started, true)
   assert.equal(typeof booted.pid, 'number')
   assert.equal(existsSync(join(work, 'webui-switch', 'state.json')), true, 'the start must be recorded')
+  assert.equal(
+    existsSync(join(work, 'webui-switch', 'web-stop.patch.yml')),
+    true,
+    'the stop overlay must be written before the child boots',
+  )
 
   const markerText = readFileSync(marker, 'utf8')
   assert.match(markerText, /listening/)
 
   const stopped = await stop({ port, profile: 'web', env: scoped, graceMs: 8000 })
   assert.equal(stopped.stopped, true, 'stop should succeed: ' + JSON.stringify(stopped))
-  const consoleStep = stopped.steps.find((s) => s.step === 'console-ctrl-c')
-  assert.notEqual(consoleStep, undefined, 'the console event must be attempted first: ' + JSON.stringify(stopped.steps))
-  // A detached child owns no console, so the honest outcome for a child this
-  // test spawned is the terminate step. What matters is that the ladder is
-  // walked in order and that the process is gone afterwards.
+  // A child this plugin started owns no console and mounts no handshake here, so
+  // neither graceful rung applies: nothing is sent to a console that does not
+  // exist, and the ladder ends in the tree kill.
+  assert.equal(
+    stopped.steps.find((s) => s.step === 'console-ctrl-c'),
+    undefined,
+    'no console event may be attempted for a child this plugin started: ' + JSON.stringify(stopped.steps),
+  )
+  assert.notEqual(
+    stopped.steps.find((s) => s.step === 'terminate-tree'),
+    undefined,
+    'the tree kill is the honest outcome here: ' + JSON.stringify(stopped.steps),
+  )
   assert.equal(stopped.reason, 'terminated', 'unexpected stop reason: ' + JSON.stringify(stopped.steps))
   assert.equal(existsSync(join(work, 'webui-switch', 'state.json')), false, 'the record must be cleared')
   assert.equal(await portListening(port), false)
   delete process.env.DSH_WEBUI_TEST_MARKER
 })
 
-await test_('a process that ignores Ctrl+C is escalated to a tree kill', async () => {
+await test_('the handshake is keyed by pid and cleared as a pair', () => {
+  const scoped = { DSH_HOME: join(work, 'handshake') }
+  assert.equal(stopRequestPath(11, scoped).endsWith('stop.11.request'), true)
+  assert.equal(stopReadyPath(12, scoped).endsWith('web-stop.12.ready'), true)
+  assert.equal(readStopReady(11, scoped), undefined, 'no record means no request is written')
+  mkdirSync(switchDir(scoped), { recursive: true })
+  writeFileSync(stopReadyPath(11, scoped), JSON.stringify({ pid: 11 }), 'utf8')
+  assert.equal(readStopReady(11, scoped).pid, 11)
+  assert.equal(readStopReady(12, scoped), undefined, 'another pid never answers for it')
+  writeFileSync(stopRequestPath(11, scoped), '{}', 'utf8')
+  clearStopFiles(11, scoped)
+  assert.equal(existsSync(stopReadyPath(11, scoped)), false)
+  assert.equal(existsSync(stopRequestPath(11, scoped)), false)
+})
+
+await test_('a record left by a dead process is swept at the next start', () => {
+  const scoped = { DSH_HOME: join(work, 'prune') }
+  mkdirSync(switchDir(scoped), { recursive: true })
+  writeFileSync(stopReadyPath(999999, scoped), JSON.stringify({ pid: 999999 }), 'utf8')
+  writeFileSync(stopRequestPath(999999, scoped), '{}', 'utf8')
+  writeFileSync(stopReadyPath(process.pid, scoped), JSON.stringify({ pid: process.pid }), 'utf8')
+  assert.equal(pruneStopFiles(scoped), 2, 'both files of the dead pid must go')
+  assert.equal(existsSync(stopReadyPath(999999, scoped)), false)
+  assert.equal(existsSync(stopRequestPath(999999, scoped)), false)
+  assert.equal(existsSync(stopReadyPath(process.pid, scoped)), true, 'a live owner keeps its record')
+})
+
+await test_('the overlay mounts this package by its own file URL', () => {
+  const scoped = { DSH_HOME: join(work, 'overlay') }
+  const path = writeStopOverlay({ env: scoped })
+  const text = readFileSync(path, 'utf8')
+  assert.match(text, /- insert:/)
+  assert.match(text, /id: webui-switch-stop/)
+  assert.match(text, /name: 'file:\/\/\/.*web-stop\.js'/, 'a file URL resolves wherever this package is installed')
+})
+
+await test_('a profile that answers the handshake leaves through appExit', async () => {
+  const port = await freePort()
+  const marker = join(work, 'marker-appexit-' + port + '.txt')
+  const scoped = { ...env, DSH_WEBUI_TEST_MARKER: marker, DSH_WEBUI_TEST_COMPANION: '1' }
+
+  const booted = await start({ port, profile: 'web', env: scoped, dshScript: DUMMY, timeoutMs: 30000 })
+  assert.equal(booted.running, true, 'the profile should be serving: ' + JSON.stringify(booted))
+  const pid = booted.pid
+  assert.equal(
+    existsSync(join(work, 'webui-switch', 'web-stop.' + pid + '.ready')),
+    true,
+    'the mounted half must record that it can answer',
+  )
+
+  const stopped = await stop({ port, profile: 'web', env: scoped, graceMs: 8000 })
+  assert.equal(stopped.stopped, true, 'stop should succeed: ' + JSON.stringify(stopped))
+  assert.equal(stopped.reason, 'app-exit', 'unexpected stop reason: ' + JSON.stringify(stopped.steps))
+  assert.notEqual(
+    stopped.steps.find((s) => s.step === 'app-exit-request'),
+    undefined,
+    'the request must be the first rung: ' + JSON.stringify(stopped.steps),
+  )
+  assert.equal(
+    stopped.steps.find((s) => s.step === 'terminate-tree'),
+    undefined,
+    'a profile that answers must not be terminated: ' + JSON.stringify(stopped.steps),
+  )
+  assert.match(readFileSync(marker, 'utf8'), /app-exit/, 'the profile must record its own exit path')
+  assert.equal(
+    existsSync(join(work, 'webui-switch', 'stop.' + pid + '.request')),
+    false,
+    'the request must be consumed, not left behind',
+  )
+  assert.equal(await portListening(port), false)
+})
+
+await test_('a profile that cannot answer is not made to wait', async () => {
+  const port = await freePort()
+  const began = Date.now()
+  const booted = await start({ port, profile: 'web', env, dshScript: DUMMY, timeoutMs: 30000 })
+  assert.equal(booted.running, true)
+  const stopped = await stop({ port, profile: 'web', env, graceMs: 30000 })
+  assert.equal(stopped.reason, 'terminated', 'without a handshake the ladder escalates at once')
+  assert.equal(
+    stopped.steps.find((s) => s.step === 'app-exit-request'),
+    undefined,
+    'no request may be written for a profile that cannot read it',
+  )
+  assert.ok(Date.now() - began < 20000, 'the stop must not wait out a grace it cannot use')
+})
+await test_('a profile that mounts nothing is escalated to a tree kill', async () => {
   const stubborn = join(work, 'stubborn.js')
   const { writeFileSync } = await import('node:fs')
   writeFileSync(
