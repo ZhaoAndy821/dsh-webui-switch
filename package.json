@@ -1,0 +1,48 @@
+{
+  "name": "dsh-webui-switch",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Start, report, and stop the local Web profile from the Desktop app: one header control that boots the WebUI windowless in the background, shows whether it is serving, and stops it - terminating the profile it started, or a console Ctrl+C first for one you started yourself in a terminal.",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "dsh": ">=0.1.7-rc.2",
+    "node": ">=20"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "desktop",
+    "web-profile",
+    "client-plugin"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node test/smoke.mjs && node test/host.mjs && node test/client.mjs"
+  }
+}

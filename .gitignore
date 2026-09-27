@@ -1,0 +1,40 @@
+# dependencies
+node_modules/
+
+# logs and scratch output
+*.log
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+logs/
+
+# installer backups: scripts/install.mjs writes <manifest>.bak-<timestamp>
+*.bak-*
+
+# test scratch
+coverage/
+.nyc_output/
+
+# editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# packed tarballs
+*.tgz
+
+# secrets and local credentials, preventively
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+.npmrc

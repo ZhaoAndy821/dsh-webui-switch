@@ -1,0 +1,11 @@
+# dsh-webui-switch bundle patch
+#
+# `dsh.bundle.patch` names this file; the profile launcher merges it after every
+# bundle layer and mounts the package's `main` entry (lib/index.js), which owns
+# the Web-profile process control and the /api routes the client half calls.
+#
+# `id` is the loader row id in the host namespace; it is unrelated to the id the
+# client bundle passes to window.__ModuleLoader__.load(), which is the package name.
+- insert:
+    - id: webui-switch
+      name: 'dsh-webui-switch'

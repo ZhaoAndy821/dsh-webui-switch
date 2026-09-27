@@ -1,0 +1,6 @@
+# Keep the stored bytes LF on every platform: the PowerShell helper and
+# the client bundle are both read as text by tooling that does not expect CRLF.
+* text=auto eol=lf
+
+# The PowerShell helper must keep its CRLF-free form for the same reason.
+*.ps1 text eol=lf
