@@ -327,7 +327,16 @@ await test_('the console helper refuses a console it shares, and sends nothing',
     await new Promise((resolve) => setTimeout(resolve, 1500))
     let code = 0
     try {
-      execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helper, '-ProcessId', String(child.pid), '-DryRun'], { stdio: 'ignore' })
+      // Run the helper exactly as windows-stop.js does, cwd included: its
+      // Add-Type compile makes csc.exe write a literal "%SystemDrive%\..."
+      // cache directory relative to the *helper's* working directory (measured
+      // 2026-10-04), so a test that starts it in the repository leaves that
+      // directory in the repository.
+      execFileSync(
+        'powershell',
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helper, '-ProcessId', String(child.pid), '-DryRun'],
+        { stdio: 'ignore', cwd: tmpdir() },
+      )
     } catch (error) {
       code = error.status
     }
