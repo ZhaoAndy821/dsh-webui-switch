@@ -179,45 +179,97 @@ await test_('the profile half journals the handshake, the request and the exit',
   const home = mkdtempSync(join(tmpdir(), 'dsh-webui-switch-journal-profile-'))
   await withProfileEnv(home, async () => {
     const ctx = fakeProfileContext()
-    applyProfileHalf(ctx)
-    await waitFor(() => readJournal({ DSH_HOME: home }, 50).some((r) => r.event === 'alive'), 3000, 'a profile heartbeat')
-    const opened = readJournal({ DSH_HOME: home }, 50)
-    assert.equal(opened.some((r) => r.event === 'handshake-ready' && r.source === 'profile'), true, 'mounting the handshake is recorded')
-    assert.equal(opened.some((r) => r.event === 'alive'), true, 'the profile says it is alive')
-    // A writer that cannot quote the nonce is refused, and the refusal is a
-    // record: this is the case that used to be indistinguishable from the
-    // plugin's own stop.
-    writeFileSync(
-      stopRequestPath(process.pid),
-      JSON.stringify({ pid: process.pid, requestedAt: new Date().toISOString() }),
-      'utf8',
-    )
-    await waitFor(
-      () => readJournal({ DSH_HOME: home }, 80).some((r) => r.event === 'stop-ignored'),
-      3000,
-      'the refusal record',
-    )
-    assert.equal(ctx.exits.length, 0, 'an unsigned request must not end the profile')
-    const ignored = readJournal({ DSH_HOME: home }, 80).find((r) => r.event === 'stop-ignored')
-    assert.equal(ignored.reason, 'wrong-nonce')
-    assert.equal(ignored.content.includes('requestedAt'), true, 'the refused bytes are quoted')
-    assert.equal(Number.isNaN(Date.parse(ignored.requestBorn)), false, 'the filesystem timestamp is kept')
+    // The disposal must run even when an assertion throws: a leaked heartbeat
+    // interval kept beating after its environment was restored on 2026-10-04 and
+    // wrote 31 records into the real DSH home. This finally is the regression.
+    try {
+      applyProfileHalf(ctx)
+      await waitFor(() => readJournal({ DSH_HOME: home }, 50).some((r) => r.event === 'alive'), 3000, 'a profile heartbeat')
+      const opened = readJournal({ DSH_HOME: home }, 50)
+      assert.equal(opened.some((r) => r.event === 'handshake-ready' && r.source === 'profile'), true, 'mounting the handshake is recorded')
+      assert.equal(opened.some((r) => r.event === 'alive'), true, 'the profile says it is alive')
+      // A writer that cannot quote the nonce is refused, and the refusal is a
+      // record: this is the case that used to be indistinguishable from the
+      // plugin's own stop.
+      writeFileSync(
+        stopRequestPath(process.pid),
+        JSON.stringify({ pid: process.pid, requestedAt: new Date().toISOString() }),
+        'utf8',
+      )
+      await waitFor(
+        () => readJournal({ DSH_HOME: home }, 80).some((r) => r.event === 'stop-ignored'),
+        3000,
+        'the refusal record',
+      )
+      assert.equal(ctx.exits.length, 0, 'an unsigned request must not end the profile')
+      const ignored = readJournal({ DSH_HOME: home }, 80).find((r) => r.event === 'stop-ignored')
+      assert.equal(ignored.reason, 'wrong-nonce')
+      assert.equal(ignored.content.includes('requestedAt'), true, 'the refused bytes are quoted')
+      assert.equal(Number.isNaN(Date.parse(ignored.requestBorn)), false, 'the filesystem timestamp is kept')
 
-    // The signed request - the one the host half writes - is obeyed.
-    const ready = readStopReady(process.pid)
-    assert.equal(typeof ready.nonce, 'string', 'the ready record publishes a nonce')
-    requestStop(process.pid, undefined, ready.nonce)
-    await waitFor(() => ctx.exits.length > 0, 3000, 'appExit to be called')
-    await waitFor(() => readJournal({ DSH_HOME: home }, 120).some((r) => r.event === 'app-exit'), 3000, 'the exit record')
-    const seen = readJournal({ DSH_HOME: home }, 120)
-    const stopSeen = seen.find((r) => r.event === 'stop-seen')
-    assert.equal(stopSeen !== undefined, true, 'seeing the signed request is recorded before it acts')
-    assert.equal(stopSeen.content.includes(ready.nonce), true, 'the obeyed request is quoted with its nonce')
-    const exit = seen.find((r) => r.event === 'app-exit')
-    assert.equal(exit.handled, true, 'this fake context provides appExit')
-    assert.equal(ctx.exits[0], 0, 'the launcher is asked to leave with code 0')
-    ctx.dispose()
+      // The signed request - the one the host half writes - is obeyed.
+      const ready = readStopReady(process.pid)
+      assert.equal(typeof ready.nonce, 'string', 'the ready record publishes a nonce')
+      requestStop(process.pid, undefined, ready.nonce)
+      await waitFor(() => ctx.exits.length > 0, 3000, 'appExit to be called')
+      await waitFor(() => readJournal({ DSH_HOME: home }, 120).some((r) => r.event === 'app-exit'), 3000, 'the exit record')
+      const seen = readJournal({ DSH_HOME: home }, 120)
+      const stopSeen = seen.find((r) => r.event === 'stop-seen')
+      assert.equal(stopSeen !== undefined, true, 'seeing the signed request is recorded before it acts')
+      assert.equal(stopSeen.content.includes(ready.nonce), true, 'the obeyed request is quoted with its nonce')
+      const exit = seen.find((r) => r.event === 'app-exit')
+      assert.equal(exit.handled, true, 'this fake context provides appExit')
+      assert.equal(ctx.exits[0], 0, 'the launcher is asked to leave with code 0')
+    } finally {
+      ctx.dispose()
+    }
     await waitFor(() => readJournal({ DSH_HOME: home }, 80).some((r) => r.event === 'handshake-gone'), 3000, 'the disposal record')
+  })
+})
+
+await test_('a heartbeat keeps writing to the home the profile started in', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-webui-switch-journal-pin-'))
+  const other = mkdtempSync(join(tmpdir(), 'dsh-webui-switch-journal-other-'))
+  await withProfileEnv(home, async () => {
+    const ctx = fakeProfileContext()
+    try {
+      applyProfileHalf(ctx)
+      await waitFor(() => readJournal({ DSH_HOME: home }, 20).some((r) => r.event === 'alive'), 3000, 'a heartbeat')
+      // Move the environment underneath the live writer, which is exactly what a
+      // leaked interval sees once its owning test has restored process.env.
+      process.env.DSH_HOME = other
+      const beforeHome = readJournal({ DSH_HOME: home }, 300).length
+      const beforeOther = readJournal({ DSH_HOME: other }, 300).length
+      await waitFor(
+        () => readJournal({ DSH_HOME: home }, 300).length > beforeHome,
+        3000,
+        'the pinned home to keep receiving beats',
+      )
+      assert.equal(
+        readJournal({ DSH_HOME: other }, 300).length,
+        beforeOther,
+        'a beat must never follow the environment into another home',
+      )
+    } finally {
+      ctx.dispose()
+    }
+  })
+})
+
+await test_('a disposed profile stops beating even if the environment moves', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-webui-switch-journal-disposed-'))
+  const other = mkdtempSync(join(tmpdir(), 'dsh-webui-switch-journal-disposed-other-'))
+  await withProfileEnv(home, async () => {
+    const ctx = fakeProfileContext()
+    applyProfileHalf(ctx)
+    await waitFor(() => readJournal({ DSH_HOME: home }, 20).some((r) => r.event === 'alive'), 3000, 'a heartbeat')
+    ctx.dispose()
+    process.env.DSH_HOME = other
+    const homeCount = readJournal({ DSH_HOME: home }, 400).length
+    const otherCount = readJournal({ DSH_HOME: other }, 400).length
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    assert.equal(readJournal({ DSH_HOME: other }, 400).length, otherCount, 'a disposed writer must not follow the environment')
+    assert.equal(readJournal({ DSH_HOME: home }, 400).length, homeCount, 'and must not keep beating where it was')
   })
 })
 
