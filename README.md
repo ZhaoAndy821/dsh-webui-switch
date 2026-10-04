@@ -110,8 +110,12 @@ injects the launcher's public `ctx.appExit`,
 records that it can answer (`web-stop.<pid>.ready`) and polls for a request
 (`stop.<pid>.request`). A stop writes that request and waits `stopGraceMs`: the row
 calls `ctx.appExit(0)`, the launcher disposes the whole Cordis tree - every plugin
-flushes and releases what it holds - and the process exits with code 0. Measured
-against a real profile: **3.5 s from request to gone, exit code 0**, request, record
+flushes and releases what it holds - and the process exits with code 0. The request
+has to quote a nonce the profile generated at mount and published only in its ready
+record; a file that does not is consumed, refused and journalled as `stop-ignored`.
+That is not a privilege boundary - anything running as this user can read the ready
+file - but it turns a stray writer into a visible no-op instead of a silent stop.
+Measured against a real profile: **3.5 s from request to gone, exit code 0**, request, record
 and state file all cleared, and no `.tmp` or lock left under the profile's home.
 The same profile terminated by a tree kill exits 1, which is the outcome this rung
 exists to avoid: a hard kill cuts in-flight state writes, and a real profile has
@@ -158,6 +162,42 @@ Stopping therefore walks a ladder and reports which step ended it:
    rung was attempted and the profile did not leave, and immediately when no
    graceful rung applies.
 
+## Lifecycle journal
+
+Every start, stop, ladder step, state decision and exit is appended to
+`$DSH_HOME/webui-switch/journal.jsonl`: one JSON object per line, written by
+**both** halves of the handshake - the Desktop Host (`"source":"host"`) and the
+Web profile itself (`"source":"profile"`, from `web-stop.js`). It exists because
+two terminations - 2026-09-27 11:47:46 and 2026-10-04 10:59:27 - could not be
+attributed to anything: nothing on disk said whether the profile had been asked
+to leave or had simply disappeared, and the record of the previous generation was
+overwritten by the next start.
+
+| question | records that answer it |
+|---|---|
+| was the profile asked to leave? | `stop-requested` (host, with the caller's origin/agent) then `stop-seen` + `app-exit` (profile) |
+| did it just vanish? | `profile-exit` with `requested:false` and no `stop-seen` anywhere |
+| when exactly did it die? | the last `alive` heartbeat from the profile, then `profile-exit` (`code`, `signal`, `uptimeMs`) |
+| did the Desktop Host die instead? | host `alive` records stop while profile `alive` records continue |
+| what did a start replace? | `profile-spawned` carries `previous` (pid and `startedAt` of the generation it replaced) |
+| was somebody else's record touched? | `state-kept` (with the reason) instead of `state-cleared` |
+| who wrote the stop request? | `stop-seen` quotes the request file's bytes and filesystem timestamps |
+| was a request refused? | `stop-ignored` with `reason` (`not-json` / `wrong-pid` / `wrong-nonce`) and the refused bytes |
+
+Read the last 40 records from the installed package:
+
+```powershell
+node --input-type=module -e "const m = await import('./lib/journal.js'); for (const r of m.readJournal(process.env, 40)) console.log(r.at, r.source, r.event, JSON.stringify(r))"
+```
+
+The heartbeat is 60 s (`DSH_WEBUI_SWITCH_HEARTBEAT_MS`, floor 200 ms) and is
+unref'd, so it never keeps the application or the profile alive. The file rotates
+at 1 MiB keeping two generations (`journal.1.jsonl`, `journal.2.jsonl`). A record
+that cannot be written is dropped silently - the journal must never be able to
+break the control it exists to explain - and the two writers append short lines,
+so a torn line is possible in principle and is skipped by the reader rather than
+thrown.
+
 ## Known limitations
 
 - **Stopping cuts the turn in flight.** DSH persists each turn as it completes,
@@ -183,7 +223,14 @@ Stopping therefore walks a ladder and reports which step ended it:
   the profile acted on it; when it does not, the ladder escalates to a tree kill.
 - **A profile killed from outside leaves its record.** The handshake files are keyed
   by pid; a record whose process no longer exists is swept at the next start rather
-  than trusted, and only the pid that wrote it can be answered.
+  than trusted, and only the pid that wrote it can be answered: a request without the
+  matching nonce is refused and journalled as `stop-ignored`.
+- **Upgrade window.** A profile started by an *older* host publishes no nonce, so a
+  newer profile accepts its request on the pid alone. In the other direction - an
+  older host stopping a profile that was started after this change - the request
+  carries no nonce and is refused, so the ladder escalates to the tree kill instead
+  of the graceful exit. Restart the Desktop application before the next WebUI start
+  to avoid that one hard stop.
 - **The pid is resolved once, then checked again.** Windows recycles pids, so the
   command line of the process about to be stopped is re-read immediately before
   acting - including for a pid this plugin recorded itself, which is exactly the
@@ -205,12 +252,13 @@ Stopping therefore walks a ladder and reports which step ended it:
 node test\smoke.mjs    # host half, against a test-double launcher
 node test\host.mjs     # request handling, on a context that records what it registers
 node test\client.mjs   # client half, loaded the way the module system loads it
+node test\journal.mjs  # the lifecycle journal: a killed profile vs a requested stop
 ```
 
 `test/client.mjs` loads the real client bundle from the profile's `node_modules`;
 set `DSH_PROFILE_MODULES` to that directory when the suite runs outside the
 profile. Counts today: smoke 18 passed / 1 skipped (the skip is the opt-in live
-probe, `DSH_WEBUI_LIVE_PORT`), host 11 passed, client 6 passed.
+probe, `DSH_WEBUI_LIVE_PORT`), host 11 passed, client 6 passed, journal 8 passed.
 
 No suite boots a real profile or touches a process you are working in. One
 check is opt-in: set `DSH_WEBUI_LIVE_PORT=<port>` to have `test\smoke.mjs`

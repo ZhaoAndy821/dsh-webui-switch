@@ -48,6 +48,6 @@
     }
   },
   "scripts": {
-    "test": "node test/smoke.mjs && node test/host.mjs && node test/client.mjs"
+    "test": "node test/smoke.mjs && node test/host.mjs && node test/client.mjs && node test/journal.mjs"
   }
 }
