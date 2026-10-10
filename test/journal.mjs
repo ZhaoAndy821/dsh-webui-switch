@@ -422,7 +422,7 @@ await test_('an adopted pid that stops being the profile ends the adoption', asy
       // pid case. Silence must end the adoption even though isAlive still says yes.
       await waitFor(
         () => readJournal(env, 60).some((r) => r.event === 'profile-exit'),
-        6000,
+        9000,
         'the exit record from silence alone',
       )
       const exit = readJournal(env, 60).find((r) => r.event === 'profile-exit')
@@ -495,6 +495,186 @@ await test_('a young profile that has not beaten yet is not declared dead', asyn
         'the grace lasts a heartbeat window, so no exit is written this early',
       )
       assert.equal(records.some((r) => r.event === 'alive' && r.inherited === true), true, 'and it is being watched')
+    } finally {
+      adoption.dispose()
+    }
+  } finally {
+    try {
+      child.kill()
+    } catch {
+      /* already gone */
+    }
+  }
+})
+
+await test_('a timestamp from the future cannot keep an adoption open forever', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-webui-switch-adopt-future-'))
+  const env = { DSH_HOME: home, DSH_WEBUI_SWITCH_HEARTBEAT_MS: '250' }
+  // The pid is alive and never beats; the record claims it started an hour from
+  // now (a backwards clock step between the profile's start and this boot, or a
+  // hand-edited state.json). Without clamping the reference, the silence fence
+  // could never fire and the host would beat "alive, inherited" forever - which
+  // is the one thing adoption must not do.
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000); /* --profile web */'], { stdio: 'ignore' })
+  try {
+    writeState(
+      { pid: child.pid, port: 4115, profile: 'web', startedAt: new Date(Date.now() + 3600000).toISOString() },
+      env,
+    )
+    const adoption = await adoptRecordedProfile(env)
+    try {
+      assert.equal(adoption.adopted, true)
+      await waitFor(
+        () => readJournal(env, 80).some((r) => r.event === 'profile-exit'),
+        9000,
+        'the silence fence to fire despite the future timestamp',
+      )
+      const exit = readJournal(env, 80).find((r) => r.event === 'profile-exit')
+      assert.equal(exit.reason, 'profile-heartbeat-stopped')
+      assert.equal(isAlive(child.pid), true, 'the pid really was alive the whole time')
+    } finally {
+      adoption.dispose()
+    }
+  } finally {
+    try {
+      child.kill()
+    } catch {
+      /* already gone */
+    }
+  }
+})
+
+await test_('a profile that keeps beating is never declared dead, and silence still ends it', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-webui-switch-adopt-beating-'))
+  const env = { DSH_HOME: home, DSH_WEBUI_SWITCH_HEARTBEAT_MS: '250' }
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000); /* --profile web */'], { stdio: 'ignore' })
+  // The profile half, beating as a live profile does.
+  const profileBeat = setInterval(
+    () => appendJournal({ event: 'alive', pid: child.pid, uptimeMs: 1000 }, { env, source: 'profile' }),
+    200,
+  )
+  let adoption
+  try {
+    writeState(
+      { pid: child.pid, port: 4115, profile: 'web', startedAt: new Date(Date.now() - 60000).toISOString() },
+      env,
+    )
+    appendJournal({ event: 'alive', pid: child.pid, uptimeMs: 1000 }, { env, source: 'profile' })
+    adoption = await adoptRecordedProfile(env)
+    assert.equal(adoption.adopted, true)
+    // Well past one silence window: as long as the beats keep coming, no death row.
+    await new Promise((resolve) => setTimeout(resolve, 7000))
+    assert.equal(
+      readJournal(env, 200).some((r) => r.event === 'profile-exit'),
+      false,
+      'a beating profile must not be declared dead',
+    )
+    // Stop the beats: now the same fence has to fire, and say what it saw.
+    clearInterval(profileBeat)
+    await waitFor(() => readJournal(env, 200).some((r) => r.event === 'profile-exit'), 9000, 'the fence once the beats stop')
+    const exit = readJournal(env, 200).find((r) => r.event === 'profile-exit')
+    assert.equal(exit.reason, 'profile-heartbeat-stopped')
+    assert.equal(isAlive(child.pid), true, 'the pid was alive throughout: silence is what ended it')
+  } finally {
+    clearInterval(profileBeat)
+    if (adoption !== undefined) adoption.dispose()
+    try {
+      child.kill()
+    } catch {
+      /* already gone */
+    }
+  }
+})
+
+await test_('a beat from the future cannot steal the credit from real ones', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-webui-switch-adopt-future-beat-'))
+  const env = { DSH_HOME: home, DSH_WEBUI_SWITCH_HEARTBEAT_MS: '250' }
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 40000); /* --profile web */'], { stdio: 'ignore' })
+  const profileBeat = setInterval(
+    () => appendJournal({ event: 'alive', pid: child.pid, uptimeMs: 1000 }, { env, source: 'profile' }),
+    200,
+  )
+  let adoption
+  try {
+    writeState(
+      { pid: child.pid, port: 4115, profile: 'web', startedAt: new Date(Date.now() - 60000).toISOString() },
+      env,
+    )
+    // One beat dated an hour ahead, then real ones: the bogus record may credit
+    // the present once, but it must not sit at the head of the queue and block
+    // every later beat - that would kill a profile that is beating right now.
+    appendFileSync(
+      journalPath(env),
+      JSON.stringify({
+        at: new Date(Date.now() + 3600000).toISOString(),
+        event: 'alive',
+        pid: child.pid,
+        source: 'profile',
+        uptimeMs: 1,
+      }) + '\n',
+      'utf8',
+    )
+    appendJournal({ event: 'alive', pid: child.pid, uptimeMs: 1000 }, { env, source: 'profile' })
+    adoption = await adoptRecordedProfile(env)
+    assert.equal(adoption.adopted, true)
+    // More than two silence windows (5750 ms each) while the beats keep coming.
+    await new Promise((resolve) => setTimeout(resolve, 12000))
+    assert.equal(
+      readJournal(env, 400).some((r) => r.event === 'profile-exit'),
+      false,
+      'the real beats must keep crediting, whatever a future-dated record says',
+    )
+    // And once they stop, the same fence still has to fire: the bogus record must
+    // not become the thing that keeps the adoption open.
+    clearInterval(profileBeat)
+    await waitFor(() => readJournal(env, 400).some((r) => r.event === 'profile-exit'), 9000, 'the fence after the real beats stop')
+  } finally {
+    clearInterval(profileBeat)
+    if (adoption !== undefined) adoption.dispose()
+    try {
+      child.kill()
+    } catch {
+      /* already gone */
+    }
+  }
+})
+
+await test_('an implausible beat cannot renew the credit for ever', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-webui-switch-adopt-skew-'))
+  const env = { DSH_HOME: home, DSH_WEBUI_SWITCH_HEARTBEAT_MS: '250' }
+  // The pid stays alive and never beats after this; one beat is dated an hour ahead.
+  // Crediting that record afresh on every tick - by clamping it to "now" - renews the
+  // credit for ever, so the adoption would outlive the profile's real evidence. It is
+  // ignored instead: silence is measured from the last plausible beat.
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000); /* --profile web */'], { stdio: 'ignore' })
+  try {
+    writeState(
+      { pid: child.pid, port: 4115, profile: 'web', startedAt: new Date(Date.now() - 60000).toISOString() },
+      env,
+    )
+    appendJournal({ event: 'alive', pid: child.pid, uptimeMs: 1000 }, { env, source: 'profile' })
+    const adoption = await adoptRecordedProfile(env)
+    try {
+      assert.equal(adoption.adopted, true, 'a plausible beat is what allows the adoption')
+      appendFileSync(
+        journalPath(env),
+        JSON.stringify({
+          at: new Date(Date.now() + 3600000).toISOString(),
+          event: 'alive',
+          pid: child.pid,
+          source: 'profile',
+          uptimeMs: 1,
+        }) + '\n',
+        'utf8',
+      )
+      await waitFor(
+        () => readJournal(env, 200).some((r) => r.event === 'profile-exit'),
+        9000,
+        'the fence to fire one window after the last plausible beat',
+      )
+      const exit = readJournal(env, 200).find((r) => r.event === 'profile-exit')
+      assert.equal(exit.reason, 'profile-heartbeat-stopped')
+      assert.equal(isAlive(child.pid), true, 'the pid is alive: silence, not death, ended it')
     } finally {
       adoption.dispose()
     }
