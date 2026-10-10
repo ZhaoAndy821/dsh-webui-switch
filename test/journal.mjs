@@ -16,7 +16,7 @@
 import assert from 'node:assert/strict'
 import net from 'node:net'
 import { execFileSync, spawn } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -428,6 +428,73 @@ await test_('an adopted pid that stops being the profile ends the adoption', asy
       const exit = readJournal(env, 60).find((r) => r.event === 'profile-exit')
       assert.equal(exit.reason, 'profile-heartbeat-stopped', 'the reason names the evidence, not a guess')
       assert.equal(isAlive(child.pid), true, 'and the process really was still alive when it was written')
+    } finally {
+      adoption.dispose()
+    }
+  } finally {
+    try {
+      child.kill()
+    } catch {
+      /* already gone */
+    }
+  }
+})
+
+await test_('the newest profile beat decides, whatever order the records are in', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-webui-switch-adopt-order-'))
+  const env = { DSH_HOME: home, DSH_WEBUI_SWITCH_HEARTBEAT_MS: '250' }
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000); /* --profile web */'], { stdio: 'ignore' })
+  try {
+    writeState(
+      { pid: child.pid, port: 4115, profile: 'web', startedAt: new Date(Date.now() - 60000).toISOString() },
+      env,
+    )
+    // An old beat first, then a fresh one: readJournal returns records oldest
+    // first, so taking the first match would measure the stale one and refuse a
+    // profile that is in fact beating right now.
+    const stale = JSON.stringify({
+      at: new Date(Date.now() - 30000).toISOString(),
+      event: 'alive',
+      pid: child.pid,
+      source: 'profile',
+      uptimeMs: 30000,
+    })
+    appendFileSync(journalPath(env), stale + '\n', 'utf8')
+    appendJournal({ event: 'alive', pid: child.pid, uptimeMs: 31000 }, { env, source: 'profile' })
+    const adoption = await adoptRecordedProfile(env)
+    try {
+      assert.equal(adoption.adopted, true, 'the fresh beat is the one that counts')
+      assert.equal(readJournal(env, 20).some((r) => r.event === 'profile-unadopted'), false)
+    } finally {
+      adoption.dispose()
+    }
+  } finally {
+    try {
+      child.kill()
+    } catch {
+      /* already gone */
+    }
+  }
+})
+
+await test_('a young profile that has not beaten yet is not declared dead', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-webui-switch-adopt-young-'))
+  const env = { DSH_HOME: home, DSH_WEBUI_SWITCH_HEARTBEAT_MS: '250' }
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000); /* --profile web */'], { stdio: 'ignore' })
+  try {
+    // Started seconds ago, so its first heartbeat is still in the future.
+    writeState({ pid: child.pid, port: 4115, profile: 'web', startedAt: new Date().toISOString() }, env)
+    const adoption = await adoptRecordedProfile(env)
+    try {
+      assert.equal(adoption.adopted, true)
+      await new Promise((resolve) => setTimeout(resolve, 1500))
+      const records = readJournal(env, 40)
+      assert.equal(
+        records.some((r) => r.event === 'profile-exit'),
+        false,
+        'the grace lasts a heartbeat window, so no exit is written this early',
+      )
+      assert.equal(records.some((r) => r.event === 'alive' && r.inherited === true), true, 'and it is being watched')
     } finally {
       adoption.dispose()
     }
