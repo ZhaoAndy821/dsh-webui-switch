@@ -28,6 +28,7 @@ import {
   readJournal,
   rotatedJournalPath,
 } from '../lib/journal.js'
+import { isAlive } from '../lib/windows-stop.js'
 import {
   adoptRecordedProfile,
   clearStateFor,
@@ -325,14 +326,18 @@ await test_('a requested stop is journalled as requested on both sides', async (
 await test_('a profile that outlived its host is adopted, keeps beating, and its end is recorded', async () => {
   const home = mkdtempSync(join(tmpdir(), 'dsh-webui-switch-adopt-'))
   const env = { DSH_HOME: home, DSH_WEBUI_SWITCH_HEARTBEAT_MS: '250' }
-  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' })
+  // The command line must not classify as foreign: adoption applies the same
+  // identity fence stop() does, so a bare pid is never taken over.
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000); /* --profile web */'], { stdio: 'ignore' })
   try {
-    // The record a previous host left behind: the process is not ours, but it is alive.
+    // The record a previous host left behind: the process is not ours, but it is
+    // alive, and the profile half has been beating for it.
     writeState(
       { pid: child.pid, port: 4115, profile: 'web', startedAt: new Date(Date.now() - 60000).toISOString() },
       env,
     )
-    const adoption = adoptRecordedProfile(env)
+    appendJournal({ event: 'alive', pid: child.pid, uptimeMs: 1000 }, { env, source: 'profile' })
+    const adoption = await adoptRecordedProfile(env)
     try {
       assert.equal(adoption.adopted, true, 'a live recorded profile is taken over')
       assert.equal(adoption.pid, child.pid)
@@ -351,9 +356,12 @@ await test_('a profile that outlived its host is adopted, keeps beating, and its
       await waitFor(() => readJournal(env, 80).some((r) => r.event === 'profile-exit'), 6000, 'the inherited exit record')
       const exit = readJournal(env, 80).find((r) => r.event === 'profile-exit')
       assert.equal(exit.inherited, true)
-      assert.equal(exit.code, null, 'a process this host did not create reports no exit code here')
+      assert.equal(exit.code, null, 'this host held no handle, so it has no code to report')
       assert.equal(exit.codeUnavailable, 'inherited-process', 'and the record says why, not "exited cleanly"')
       assert.equal(typeof exit.uptimeMs, 'number')
+      // The journal's own "did it vanish" reading needs the field to exist: an
+      // absent one is indistinguishable from an unanswered question.
+      assert.equal(exit.requested, false, 'this host never asked it to leave, and says so')
     } finally {
       adoption.dispose()
     }
@@ -366,7 +374,73 @@ await test_('a profile that outlived its host is adopted, keeps beating, and its
   }
 })
 
-await test_('a record whose process is already gone is written down instead of silently replaced', async () => {
+await test_('adoption refuses a recorded pid whose command line is something else', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-webui-switch-adopt-foreign-'))
+  const env = { DSH_HOME: home }
+  // No --profile: classifyCommand calls this foreign, which is the whole point.
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' })
+  try {
+    writeState(
+      { pid: child.pid, port: 4115, profile: 'web', startedAt: new Date(Date.now() - 60000).toISOString() },
+      env,
+    )
+    const adoption = await adoptRecordedProfile(env)
+    try {
+      assert.equal(adoption.adopted, false)
+      assert.equal(adoption.reason, 'target-changed')
+      const records = readJournal(env, 40)
+      assert.equal(records.some((r) => r.event === 'profile-adopted'), false, 'a foreign process is never adopted')
+      const refused = records.find((r) => r.event === 'profile-unadopted')
+      assert.equal(refused.reason, 'target-changed')
+      assert.equal(typeof refused.observed, 'string', 'the record quotes the command line it refused')
+    } finally {
+      adoption.dispose()
+    }
+  } finally {
+    try {
+      child.kill()
+    } catch {
+      /* already gone */
+    }
+  }
+})
+
+await test_('an adopted pid that stops being the profile ends the adoption', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-webui-switch-adopt-silent-'))
+  const env = { DSH_HOME: home, DSH_WEBUI_SWITCH_HEARTBEAT_MS: '250' }
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000); /* --profile web */'], { stdio: 'ignore' })
+  try {
+    writeState(
+      { pid: child.pid, port: 4115, profile: 'web', startedAt: new Date(Date.now() - 60000).toISOString() },
+      env,
+    )
+    appendJournal({ event: 'alive', pid: child.pid, uptimeMs: 1000 }, { env, source: 'profile' })
+    const adoption = await adoptRecordedProfile(env)
+    try {
+      assert.equal(adoption.adopted, true)
+      // The process stays alive while the profile half goes quiet - the recycled
+      // pid case. Silence must end the adoption even though isAlive still says yes.
+      await waitFor(
+        () => readJournal(env, 60).some((r) => r.event === 'profile-exit'),
+        6000,
+        'the exit record from silence alone',
+      )
+      const exit = readJournal(env, 60).find((r) => r.event === 'profile-exit')
+      assert.equal(exit.reason, 'profile-heartbeat-stopped', 'the reason names the evidence, not a guess')
+      assert.equal(isAlive(child.pid), true, 'and the process really was still alive when it was written')
+    } finally {
+      adoption.dispose()
+    }
+  } finally {
+    try {
+      child.kill()
+    } catch {
+      /* already gone */
+    }
+  }
+})
+
+await test_('a record whose process is already gone is announced once, not once per boot', async () => {
   const home = mkdtempSync(join(tmpdir(), 'dsh-webui-switch-adopt-gone-'))
   const env = { DSH_HOME: home }
   const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' })
@@ -377,19 +451,30 @@ await test_('a record whose process is already gone is written down instead of s
     { pid: child.pid, port: 4115, profile: 'web', startedAt: new Date(Date.now() - 3600000).toISOString() },
     env,
   )
-  const adoption = adoptRecordedProfile(env)
+  const first = await adoptRecordedProfile(env)
   try {
-    assert.equal(adoption.adopted, false)
-    assert.equal(adoption.reason, 'gone-before-adoption')
-    const records = readJournal(env, 20)
-    assert.equal(records.some((r) => r.event === 'profile-adopted'), false, 'nothing alive was taken over')
-    const exit = records.find((r) => r.event === 'profile-exit')
-    assert.equal(exit.reason, 'gone-before-adoption')
-    assert.equal(exit.inherited, true)
-    assert.equal(exit.code, null)
-    assert.equal(typeof exit.uptimeMs, 'number', 'the record still dates how long that profile had been up')
+    assert.equal(first.adopted, false)
+    assert.equal(first.reason, 'gone-before-adoption')
+    // A host that restarts while the dead record is still on disk must not
+    // re-announce the same death: the journal already holds it.
+    const second = await adoptRecordedProfile(env)
+    try {
+      assert.equal(second.reason, 'gone-before-adoption')
+      const records = readJournal(env, 40)
+      const announced = records.filter((r) => r.event === 'profile-exit' && r.reason === 'gone-before-adoption')
+      assert.equal(announced.length, 1, 'one row for one death, however many hosts load')
+      assert.equal(records.some((r) => r.event === 'profile-exit-known'), true, 'the later load says it already knew')
+      assert.equal(records.some((r) => r.event === 'profile-adopted'), false, 'nothing alive was taken over')
+      const exit = announced[0]
+      assert.equal(exit.inherited, true)
+      assert.equal(exit.code, null)
+      assert.equal(exit.requested, false)
+      assert.equal(typeof exit.uptimeMs, 'number', 'the row still dates how long that profile had been up')
+    } finally {
+      second.dispose()
+    }
   } finally {
-    adoption.dispose()
+    first.dispose()
   }
 })
 

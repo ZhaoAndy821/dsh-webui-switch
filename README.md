@@ -179,8 +179,9 @@ overwritten by the next start.
 | did it just vanish? | `profile-exit` with `requested:false` and no `stop-seen` anywhere |
 | when exactly did it die? | the last `alive` heartbeat from the profile, then `profile-exit` (`code`, `signal`, `uptimeMs`) |
 | did the Desktop Host die instead? | host `alive` records stop while profile `alive` records continue |
-| did the profile outlive its host? | `profile-adopted` (host, `inherited:true`) - the new host takes over the record and keeps beating |
-| why is an adopted exit's `code` null? | `codeUnavailable:"inherited-process"` - measured 2026-10-10: a process this host did not create reports no exit code, so the record says why instead of implying a clean exit |
+| did the profile outlive its host? | `profile-adopted` (host, `inherited:true`) - the new host takes over the record and keeps beating; a record it refuses to take over is `profile-unadopted` with `reason` (`target-changed` / `no-recent-profile-beat`) and the command line it read |
+| was an adopted profile's stop answered? | its `profile-exit` carries `requested` like any other, and `stop-requested` records `observed:true` for it |
+| why is an adopted exit's `code` null? | `codeUnavailable:"inherited-process"` - measured 2026-10-10: querying after the fact through `Get-Process`, `[Diagnostics.Process]::GetProcessById` or `Wait-Process`, a process this host did not create reports no exit code (a handle held across the exit would return it, and this host never holds one), so the record says why instead of implying a clean exit |
 | what did a start replace? | `profile-spawned` carries `previous` (pid and `startedAt` of the generation it replaced) |
 | was somebody else's record touched? | `state-kept` (with the reason) instead of `state-cleared` |
 | who wrote the stop request? | `stop-seen` quotes the request file's bytes and filesystem timestamps |
