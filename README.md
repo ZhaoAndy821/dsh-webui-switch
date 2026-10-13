@@ -179,6 +179,7 @@ overwritten by the next start.
 | did it just vanish? | `profile-exit` with `requested:false` and no `stop-seen` anywhere |
 | when exactly did it die? | the last `alive` heartbeat from the profile, then `profile-exit` (`code`, `signal`, `uptimeMs`) |
 | did the Desktop Host die instead? | host `alive` records stop while profile `alive` records continue |
+| could a job object be killing it? | `host-job` (host, at load and before every spawn) - the **innermost** job the host is directly in: its flag word, the decoded `dieOnUnhandledException`/`killOnJobClose`, the memory and process-count limits and the peaks. Windows nests jobs and limits from the whole chain apply, so `dieOnUnhandledException:false` rules out the innermost job only; an outer job is not visible from inside the process. A failed query is still an ordinary `host-job` record carrying `inJob:false` plus the Win32 `lastError`, so "not in a job" and "could not be read" stay distinguishable; `host-job-unknown` means the helper itself could not run or its output could not be parsed |
 | did the profile outlive its host? | `profile-adopted` (host, `inherited:true`) - the new host takes over the record and keeps beating; a record it refuses to take over is `profile-unadopted` with `reason` (`target-changed` / `no-recent-profile-beat`) and the command line it read |
 | was an adopted profile's stop answered? | its `profile-exit` carries `requested` like any other, and `stop-requested` records `observed:true` for it |
 | what code did an adopted process exit with? | `code` with `codeSource:"handle"` - a waiter opens a handle while the process is alive and reads its code the moment it ends (measured: a clean exit reports its own code, `taskkill /F` and Node's kill report `1`, `Stop-Process -Force` reports `4294967295`, an abort reports `0x80000003`) |
@@ -193,6 +194,17 @@ Read the last 40 records from the installed package:
 ```powershell
 node --input-type=module -e "const m = await import('./lib/journal.js'); for (const r of m.readJournal(process.env, 40)) console.log(r.at, r.source, r.event, JSON.stringify(r))"
 ```
+
+The exit code of an adopted profile is read by a waiter that has to start first; if it has not
+reported within ten seconds the record is written without the code, so that race is narrowed,
+not removed.
+
+A profile is spawned with `NODE_OPTIONS` gaining `--report-on-fatalerror` and a report directory at
+`$DSH_HOME/logs/node-reports`: a fatal V8 error writes a report naming the failing
+subsystem, which is evidence a silent native termination never leaves. It is not a
+guaranteed witness for every death it was added for - the `0xC0000409` fail-fast shape
+can be produced below V8, without ever reaching that hook - so it is one instrument
+next to the exit code and the job record, not a replacement for them.
 
 The heartbeat is 60 s (`DSH_WEBUI_SWITCH_HEARTBEAT_MS`, floor 200 ms) and is
 unref'd, so it never keeps the application or the profile alive. Each `alive`

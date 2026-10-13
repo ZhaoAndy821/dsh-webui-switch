@@ -31,6 +31,8 @@ import {
 import { isAlive } from '../lib/windows-stop.js'
 import {
   adoptRecordedProfile,
+  recordHostJob,
+  withDiagnostics,
   clearStateFor,
   clearStaleState,
   readState,
@@ -365,7 +367,7 @@ await test_('a profile that outlived its host is adopted, keeps beating, and its
       assert.equal(hostBeat.pid, child.pid, 'while still naming the profile it watches')
       assert.equal(hostBeat.rssBytes > 5 * 1024 * 1024, true, 'a real measurement of the host, not a placeholder')
       child.kill()
-      await waitFor(() => readJournal(env, 80).some((r) => r.event === 'profile-exit'), 6000, 'the inherited exit record')
+      await waitFor(() => readJournal(env, 80).some((r) => r.event === 'profile-exit'), 15000, 'the inherited exit record')
       const exit = readJournal(env, 80).find((r) => r.event === 'profile-exit')
       assert.equal(exit.inherited, true)
       assert.equal(
@@ -732,6 +734,45 @@ await test_('a disposed adoption writes nothing afterwards', async () => {
       /* already gone */
     }
   }
+})
+
+await test_('the host job limits are journalled, so a job-level kill can be told from a crash', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-webui-switch-job-'))
+  const env = { DSH_HOME: home }
+  const record = await recordHostJob(env)
+  // The instrument is required here, not optional: this plugin already depends on
+  // PowerShell, netstat and taskkill, so a helper that cannot run is a real failure
+  // and this test must not pass quietly with the numbers unasserted.
+  const written = readJournal(env, 20).find((r) => r.event === 'host-job' || r.event === 'host-job-unknown')
+  assert.equal(written !== undefined, true, 'something is always written, even when the job cannot be read')
+  assert.equal(
+    written.event,
+    'host-job',
+    'the job could not be read, so the instrument is dead: ' + JSON.stringify(written),
+  )
+  assert.equal(typeof written.inJob, 'boolean', 'inJob is a boolean: ' + JSON.stringify(written))
+  if (written.inJob) {
+    // Only meaningful when there is a job to describe: a host genuinely outside one
+    // reports inJob:false and no limits at all.
+    assert.equal(typeof written.limitFlags, 'string', 'the raw flags are kept as written by the helper')
+    assert.equal(typeof written.jobMemoryLimitMB, 'number', 'the memory limits are reported')
+    assert.equal(typeof written.activeProcessLimit, 'number', 'and the process-count limit')
+    assert.equal(typeof written.dieOnUnhandledException, 'boolean', 'the flag that turns a crash into a silent kill')
+  } else {
+    assert.equal(typeof written.lastError, 'number', 'a failed query carries the Win32 error: ' + JSON.stringify(written))
+  }
+  assert.equal(record !== undefined, true)
+})
+
+await test_('the profile environment gains the V8 report flags without losing its own', async () => {
+  const first = withDiagnostics({ NODE_OPTIONS: '--max-old-space-size=4096' }, 'C:/tmp/reports')
+  assert.equal(first.NODE_OPTIONS.includes('--report-on-fatalerror'), true)
+  assert.equal(first.NODE_OPTIONS.includes('--report-directory=C:/tmp/reports'), true)
+  assert.equal(first.NODE_OPTIONS.includes('--max-old-space-size=4096'), true, 'an existing NODE_OPTIONS survives')
+  const again = withDiagnostics(first, 'C:/tmp/reports')
+  assert.equal(again.NODE_OPTIONS, first.NODE_OPTIONS, 'adding them twice is a no-op')
+  const empty = withDiagnostics({}, 'C:/tmp/reports')
+  assert.equal(empty.NODE_OPTIONS.startsWith('--report-on-fatalerror'), true, 'no leading space when there was none')
 })
 
 await test_('a record whose process is already gone is announced once, not once per boot', async () => {
