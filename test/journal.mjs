@@ -368,8 +368,13 @@ await test_('a profile that outlived its host is adopted, keeps beating, and its
       await waitFor(() => readJournal(env, 80).some((r) => r.event === 'profile-exit'), 6000, 'the inherited exit record')
       const exit = readJournal(env, 80).find((r) => r.event === 'profile-exit')
       assert.equal(exit.inherited, true)
-      assert.equal(exit.code, null, 'this host held no handle, so it has no code to report')
-      assert.equal(exit.codeUnavailable, 'inherited-process', 'and the record says why, not "exited cleanly"')
+      assert.equal(
+        typeof exit.code,
+        'number',
+        'the code of an adopted process is read from a handle opened while it lived: ' + JSON.stringify(exit),
+      )
+      assert.equal(exit.codeSource, 'handle', 'and the record says where that code came from')
+      assert.equal(exit.codeUnavailable, undefined, 'so the fallback is not used when the handle worked')
       assert.equal(typeof exit.uptimeMs, 'number')
       // The journal's own "did it vanish" reading needs the field to exist: an
       // absent one is indistinguishable from an unanswered question.
@@ -690,6 +695,36 @@ await test_('an implausible beat cannot renew the credit for ever', async () => 
     } finally {
       adoption.dispose()
     }
+  } finally {
+    try {
+      child.kill()
+    } catch {
+      /* already gone */
+    }
+  }
+})
+
+await test_('a disposed adoption writes nothing afterwards', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-webui-switch-adopt-disposed-'))
+  const env = { DSH_HOME: home, DSH_WEBUI_SWITCH_HEARTBEAT_MS: '250' }
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000); /* --profile web */'], { stdio: 'ignore' })
+  try {
+    writeState(
+      { pid: child.pid, port: 4115, profile: 'web', startedAt: new Date(Date.now() - 60000).toISOString() },
+      env,
+    )
+    appendJournal({ event: 'alive', pid: child.pid, uptimeMs: 1000 }, { env, source: 'profile' })
+    const adoption = await adoptRecordedProfile(env)
+    assert.equal(adoption.adopted, true)
+    child.kill()
+    // Let the one-second poll notice the death and arm its grace, then dispose inside
+    // that window: a review measured a record written ~1.3 s AFTER dispose returned.
+    await new Promise((resolve) => setTimeout(resolve, 1400))
+    adoption.dispose()
+    const atDispose = readJournal(env, 200).filter((r) => r.event === 'profile-exit').length
+    await new Promise((resolve) => setTimeout(resolve, 3600))
+    const after = readJournal(env, 200).filter((r) => r.event === 'profile-exit').length
+    assert.equal(after, atDispose, 'a disposed adoption must not write a record from a pending grace')
   } finally {
     try {
       child.kill()
