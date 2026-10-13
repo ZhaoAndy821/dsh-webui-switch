@@ -194,7 +194,11 @@ node --input-type=module -e "const m = await import('./lib/journal.js'); for (co
 ```
 
 The heartbeat is 60 s (`DSH_WEBUI_SWITCH_HEARTBEAT_MS`, floor 200 ms) and is
-unref'd, so it never keeps the application or the profile alive. The file rotates
+unref'd, so it never keeps the application or the profile alive. Each `alive`
+record carries `rssBytes` and `rssPid` - the writer's own resident size and the process
+it belongs to - so a process that dies of memory leaves a rising trend behind it
+instead of a bare exit code. `rssPid` matters on host beats, whose `pid` is the
+profile's while the number is the Host's. The file rotates
 at 1 MiB keeping two generations (`journal.1.jsonl`, `journal.2.jsonl`). A record
 that cannot be written is dropped silently - the journal must never be able to
 break the control it exists to explain - and the two writers append short lines,

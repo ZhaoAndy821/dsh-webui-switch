@@ -197,6 +197,14 @@ await test_('the profile half journals the handshake, the request and the exit',
       const opened = readJournal({ DSH_HOME: home }, 50)
       assert.equal(opened.some((r) => r.event === 'handshake-ready' && r.source === 'profile'), true, 'mounting the handshake is recorded')
       assert.equal(opened.some((r) => r.event === 'alive'), true, 'the profile says it is alive')
+      const profileBeat = opened.find((r) => r.event === 'alive' && r.source === 'profile')
+      assert.equal(profileBeat.rssPid, process.pid, 'the beat names the process the number belongs to')
+      assert.equal(typeof profileBeat.rssBytes, 'number', 'the beat carries the profile own resident size')
+      assert.equal(
+        profileBeat.rssBytes > 5 * 1024 * 1024,
+        true,
+        'and it is a real measurement: a constant placeholder could not reach 5 MB (got ' + profileBeat.rssBytes + ')',
+      )
       // A writer that cannot quote the nonce is refused, and the refusal is a
       // record: this is the case that used to be indistinguishable from the
       // plugin's own stop.
@@ -352,6 +360,10 @@ await test_('a profile that outlived its host is adopted, keeps beating, and its
         4000,
         'an inherited heartbeat',
       )
+      const hostBeat = readJournal(env, 60).find((r) => r.event === 'alive' && r.inherited === true)
+      assert.equal(hostBeat.rssPid, process.pid, 'a host beat says whose memory it reports, not just whose pid it watches')
+      assert.equal(hostBeat.pid, child.pid, 'while still naming the profile it watches')
+      assert.equal(hostBeat.rssBytes > 5 * 1024 * 1024, true, 'a real measurement of the host, not a placeholder')
       child.kill()
       await waitFor(() => readJournal(env, 80).some((r) => r.event === 'profile-exit'), 6000, 'the inherited exit record')
       const exit = readJournal(env, 80).find((r) => r.event === 'profile-exit')
